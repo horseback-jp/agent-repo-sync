@@ -1,0 +1,82 @@
+# ==============================================================================
+# REFERENCE GITHUB ACTIONS WORKFLOW TEMPLATE
+# ==============================================================================
+# PURPOSE:
+#   Demonstrates how to integrate the GECX Server Synchronization Audit into 
+#   your team's GitHub Actions CI/CD deploy pipeline.
+#
+# DIRECTIONS FOR USE:
+#   1. Copy this template to your repository's `.github/workflows/deploy.yml`.
+#   2. Replace all `<PLACEHOLDERS>` (e.g. GECX App ID, Project ID, Location).
+#   3. Configure your Google Workload Identity Federation (WIF) or GECX credentials.
+# ==============================================================================
+
+name: Deploy GECX Agent & Run Synchronization Audit
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  deploy:
+    name: Deploy & Sync Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for Workload Identity Federation
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      # ========================================================================
+      # AUTHENTICATION: Configure GCP WIF or Service Account secrets
+      # ========================================================================
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          # Replace with your team's WIF provider and deployer service-account
+          workload_identity_provider: 'projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>'
+          service_account: '<DEPLOYER_SA>@<PROJECT_ID>.iam.gserviceaccount.com'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CXAS SDK & CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install cxas-scrapi
+
+      - name: Lint Agent Configurations (GECX Linter)
+        run: |
+          # Replace '<LOCAL_APP_DIR>' with your repository app folder (e.g. cxas_app/my_agent)
+          cxas lint --app-dir <LOCAL_APP_DIR>
+
+      # ========================================================================
+      # DEPLOYMENT: Push the repository configs to Google Cloud GECX
+      # ========================================================================
+      - name: Push Agent to Production GECX App
+        run: |
+          # Replace '<LOCAL_APP_DIR>', '<PROJECT_ID>', and '<LOCATION>'
+          cxas push --app-dir <LOCAL_APP_DIR> \
+            --to projects/<PROJECT_ID>/locations/<LOCATION>/apps/<APP_ID> \
+            --project-id <PROJECT_ID> --location <LOCATION>
+
+      # ========================================================================
+      # AUDIT: Run the Synchronization Audit post-deployment
+      # ========================================================================
+      - name: Run GECX Server Synchronization Audit (Dry-Run)
+        run: |
+          # Automatically runs the audit dry-run using the checked-out script.
+          # Replace '<PROJECT_ID>', '<LOCATION>', '<APP_ID>', and '<LOCAL_APP_DIR>'
+          python prune_gecx_assets.py \
+            --mode=audit \
+            --app-name=projects/<PROJECT_ID>/locations/<LOCATION>/apps/<APP_ID> \
+            --app-dir=<LOCAL_APP_DIR>
