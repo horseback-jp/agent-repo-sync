@@ -17,47 +17,79 @@ prune_gecx_assets — Generic GECX Server Garbage Collection & Audit CLI
 
 Enables:
   - --mode=audit: Dry-run scan that writes descriptive Markdown tables of orphans
-                 (Object Type, Display Name, System ID) to GitHub step summaries.
+                 (Tools, Sub-Agents, Variables) to GitHub step summaries.
   - --mode=prune: Interactive terminal actuator offering selective All, None,
                  or One-by-One manual deletions.
 """
 
 import argparse
+import json
 import os
 import sys
-from cxas_scrapi.core.tools import Tools
+from google.api_core.exceptions import FailedPrecondition
+from cxas_scrapi import Tools
+from cxas_scrapi import Agents
 
 
 def fetch_local_and_live_assets(app_name, app_dir):
-    """Queries GECX Cloud server and scans local repository folders to find orphaned tools.
+    """Queries GECX Cloud server and scans local repository folders to find orphaned tools, sub-agents, and variables.
 
     Args:
         app_name: Deployed GECX App resource name (projects/.../apps/...).
         app_dir: Path to the local application folder containing app.json.
     """
     t_client = Tools(app_name=app_name)
+    a_client = Agents(app_name=app_name)  # Class extends Apps; handles both agents & variables!
 
     # 1. Resolve local Git workspace directories dynamically relative to app_dir
     local_tools_dir = os.path.abspath(os.path.join(app_dir, "tools"))
     local_toolsets_dir = os.path.abspath(os.path.join(app_dir, "toolsets"))
+    local_agents_dir = os.path.abspath(os.path.join(app_dir, "agents"))
+    app_json_path = os.path.abspath(os.path.join(app_dir, "app.json"))
 
+    # Scan local tools
     local_tool_ids = set()
     if os.path.exists(local_tools_dir):
         for item in os.listdir(local_tools_dir):
             if os.path.isdir(os.path.join(local_tools_dir, item)):
                 local_tool_ids.add(item)
 
+    # Scan local toolsets
     local_toolset_ids = set()
     if os.path.exists(local_toolsets_dir):
         for item in os.listdir(local_toolsets_dir):
             if os.path.isdir(os.path.join(local_toolsets_dir, item)):
                 local_toolset_ids.add(item)
 
-    # 2. Fetch live deployed tools from Google Cloud GECX
-    print(f"Fetching active deployed assets from GECX server: {app_name}...")
-    live_tools = t_client.list_tools()
+    # Scan local sub-agents
+    local_agent_ids = set()
+    if os.path.exists(local_agents_dir):
+        for item in os.listdir(local_agents_dir):
+            if os.path.isdir(os.path.join(local_agents_dir, item)):
+                local_agent_ids.add(item)
+
+    # Scan local variable declarations inside app.json
+    local_variable_names = set()
+    if os.path.exists(app_json_path):
+        try:
+            with open(app_json_path, "r") as f:
+                app_data = json.load(f)
+                var_decls = app_data.get("variableDeclarations", [])
+                for v in var_decls:
+                    if "name" in v:
+                        local_variable_names.add(v["name"])
+        except Exception as e:
+            print(f"[WARNING] Could not parse variables from local app.json: {e}")
+
+    print(f"Local active tools in Git: {local_tool_ids}")
+    print(f"Local active sub-agents in Git: {local_agent_ids}")
+    print(f"Local active variables in Git: {local_variable_names}")
 
     orphans = []
+
+    # 2. Fetch live deployed Tools from Google Cloud GECX
+    print("\nFetching active deployed Tools from GECX cloud server...")
+    live_tools = t_client.list_tools()
     for t in live_tools:
         system_id = t.name.split("/")[-1]
         is_toolset = "/toolsets/" in t.name
@@ -83,7 +115,41 @@ def fetch_local_and_live_assets(app_name, app_dir):
                     }
                 )
 
-    return t_client, orphans
+    # 3. Fetch live deployed Sub-Agents from GECX
+    print("Fetching active deployed Sub-Agents from GECX cloud server...")
+    live_agents = a_client.list_agents()
+    for agent in live_agents:
+        system_id = agent.name.split("/")[-1]
+        # Core default entry point root_agent/root should NEVER be pruned
+        if system_id in ["root_agent", "root"]:
+            continue
+
+        if system_id not in local_agent_ids:
+            orphans.append(
+                {
+                    "type": "Sub-Agent",
+                    "display_name": agent.display_name,
+                    "system_id": system_id,
+                    "resource_path": agent.name,
+                }
+            )
+
+    # 4. Fetch live Variable Declarations from GECX App metadata
+    print("Fetching live Variable Declarations from GECX cloud app...")
+    app_config = a_client.get_app(app_name=app_name)
+    live_variables = app_config.variable_declarations or []
+    for v in live_variables:
+        if v.name not in local_variable_names:
+            orphans.append(
+                {
+                    "type": "Variable",
+                    "display_name": v.name,
+                    "system_id": v.name,
+                    "resource_path": v.name,
+                }
+            )
+
+    return t_client, a_client, app_config, orphans
 
 
 def run_audit(orphans):
@@ -91,7 +157,6 @@ def run_audit(orphans):
 
     if not orphans:
         print("All GECX assets are perfectly in sync with Git! 0 orphans found.")
-        # Output a clean summary to GITHUB_STEP_SUMMARY if running in CI
         summary_env = os.getenv("GITHUB_STEP_SUMMARY")
         if summary_env:
             with open(summary_env, "a") as f:
@@ -104,7 +169,7 @@ def run_audit(orphans):
     # Format descriptive markdown table
     table = []
     table.append(
-        "| Object Type | Display Name | System ID | Git Status | Action Recommended |"
+        "| Object Type | Display Name / Variable Name | System ID / Variable Name | Git Status | Action Recommended |"
     )
     table.append(
         "| :--- | :--- | :--- | :--- | :--- |"
@@ -116,13 +181,11 @@ def run_audit(orphans):
 
     markdown_table = "\n".join(table)
 
-    # Print to stdout for CLI review
     print("GECX Orphaned Assets Audit Summary:")
     print("-----------------------------------")
     for row in table:
         print(row)
 
-    # Write directly to GITHUB_STEP_SUMMARY if running inside GitHub Actions
     summary_env = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_env:
         with open(summary_env, "a") as f:
@@ -137,7 +200,7 @@ def run_audit(orphans):
         print("\n[INFO] Successfully wrote audit table to GitHub Step Summary.")
 
 
-def run_prune(t_client, orphans):
+def run_prune(t_client, a_client, app_name, app_config, orphans):
     if not orphans:
         print("\nNo orphaned assets found on the GECX server. Nothing to prune!")
         return
@@ -146,7 +209,7 @@ def run_prune(t_client, orphans):
     print("-------------------------------------------------------------------")
     for idx, o in enumerate(orphans, 1):
         print(
-            f" [{idx}] {o['type']} ➔ Display Name: {o['display_name']} | System ID: {o['system_id']}"
+            f" [{idx}] {o['type']} ➔ Display Name: {o['display_name']} | ID/System Name: {o['system_id']}"
         )
 
     print("\nChoose an operation to proceed:")
@@ -154,7 +217,6 @@ def run_prune(t_client, orphans):
     print(" [S] Selectively review and delete assets ONE-BY-ONE")
     print(" [N] Leave all and Exit")
 
-    # Fetch user choice from interactive prompt
     try:
         choice = input("\nSelect option (A/S/N) [N]: ").strip().upper()
     except (KeyboardInterrupt, EOFError):
@@ -163,14 +225,42 @@ def run_prune(t_client, orphans):
 
     if choice == "A":
         print("\nPruning all orphaned assets...")
+        updated_variables = list(app_config.variable_declarations or [])
+        vars_changed = False
+
         for o in orphans:
-            print(f"Deleting {o['type']} '{o['display_name']}' ({o['system_id']})...")
-            t_client.delete_tool(o["resource_path"])
-            print("Successfully deleted.")
+            if o["type"] == "Tool" or o["type"] == "Toolset":
+                print(f"Deleting Tool '{o['display_name']}' ({o['system_id']})...")
+                t_client.delete_tool(o["resource_path"])
+            elif o["type"] == "Sub-Agent":
+                print(
+                    f"Deleting Sub-Agent '{o['display_name']}' ({o['system_id']})..."
+                )
+                try:
+                    a_client.delete_agent(o["resource_path"])
+                    print("Successfully deleted Sub-Agent.")
+                except FailedPrecondition as e:
+                    print(f"\n[DEPENDENCY WARNING] Skipping deletion of Sub-Agent '{o['display_name']}'.")
+                    print(f"  Reason: {e.message}")
+                    print(f"  Action Required: Please remove any routing rules or transitions pointing to '{o['display_name']}' in the GECX Console first, and re-run the pruner.\n")
+            elif o["type"] == "Variable":
+                print(f"Removing Variable '{o['system_id']}' from staging config...")
+                updated_variables = [
+                    v for v in updated_variables if v.name != o["system_id"]
+                ]
+                vars_changed = True
+
+        if vars_changed:
+            print("\nSynchronizing App variable configurations back to Google Cloud...")
+            a_client.update_app(app_name=app_name, variable_declarations=updated_variables)
+
         print("\nGECX Server Pruning completed successfully!")
 
     elif choice == "S":
         print("\nInitiating Selective One-by-One review...")
+        updated_variables = list(app_config.variable_declarations or [])
+        vars_changed = False
+
         for idx, o in enumerate(orphans, 1):
             try:
                 confirm = (
@@ -186,10 +276,31 @@ def run_prune(t_client, orphans):
 
             if confirm in ["y", "yes"]:
                 print("Deleting...")
-                t_client.delete_tool(o["resource_path"])
-                print("Successfully deleted.")
+                if o["type"] == "Tool" or o["type"] == "Toolset":
+                    t_client.delete_tool(o["resource_path"])
+                    print("Successfully deleted Tool.")
+                elif o["type"] == "Sub-Agent":
+                    try:
+                        a_client.delete_agent(o["resource_path"])
+                        print("Successfully deleted Sub-Agent.")
+                    except FailedPrecondition as e:
+                        print(f"\n[DEPENDENCY WARNING] Skipping deletion of Sub-Agent '{o['display_name']}'.")
+                        print(f"  Reason: {e.message}")
+                        print(f"  Action Required: Please remove any routing rules or transitions pointing to '{o['display_name']}' in the GECX Console first, and re-run the pruner.\n")
+                elif o["type"] == "Variable":
+                    updated_variables = [
+                        v for v in updated_variables if v.name != o["system_id"]
+                    ]
+                    vars_changed = True
+                    print("Variable removed from local staging config.")
             else:
                 print("Skipped.")
+
+        if vars_changed:
+            print("\nPushing updated GECX variables configuration to Google Cloud...")
+            a_client.update_app(app_name=app_name, variable_declarations=updated_variables)
+            print("Variables synchronized successfully.")
+
         print("\nSelective pruning completed.")
 
     else:
@@ -201,7 +312,7 @@ def main():
     parser.add_argument(
         "--app-name",
         required=True,
-        help="Deployed GECX App resource name ID (e.g. projects/<id>/locations/<region>/apps/<app_id>)",
+        help="Target GECX App Resource Name ID (e.g. projects/<id>/locations/<region>/apps/<app_id>)",
     )
     parser.add_argument(
         "--app-dir",
@@ -216,17 +327,18 @@ def main():
     )
     args = parser.parse_args()
 
-    # Verify local app directory exists
     if not os.path.exists(args.app_dir):
         print(f"[ERROR] Local GECX app directory does not exist: {args.app_dir}")
         sys.exit(1)
 
-    t_client, orphans = fetch_local_and_live_assets(args.app_name, args.app_dir)
+    t_client, a_client, app_config, orphans = fetch_local_and_live_assets(
+        args.app_name, args.app_dir
+    )
 
     if args.mode == "audit":
         run_audit(orphans)
     elif args.mode == "prune":
-        run_prune(t_client, orphans)
+        run_prune(t_client, a_client, args.app_name, app_config, orphans)
 
 
 if __name__ == "__main__":
